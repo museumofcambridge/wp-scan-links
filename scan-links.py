@@ -246,7 +246,7 @@ def test_url(url, timeout):
     def _fetch(u):
         try:
             resp = requests.head(u, timeout=timeout, allow_redirects=True, headers=headers)
-            if resp.status_code == 405:
+            if resp.status_code in (403, 405):
                 resp = requests.get(
                     u, timeout=timeout, allow_redirects=True, headers=headers, stream=True
                 )

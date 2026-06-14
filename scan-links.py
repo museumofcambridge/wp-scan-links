@@ -106,6 +106,7 @@ BROWSER_ONLY_DOMAINS = {
     "ancestry.no",
     "ancestry.dk",
     "ancestry.mx",
+    "freepages.rootsweb.com",
 }
 
 
@@ -114,6 +115,37 @@ def _is_browser_only(url: str) -> bool:
     return host in BROWSER_ONLY_DOMAINS or any(
         host.endswith("." + d) for d in BROWSER_ONLY_DOMAINS
     )
+
+
+# Markers found in Cloudflare JS/managed-challenge response bodies
+CF_CHALLENGE_MARKERS = (
+    "just a moment",
+    "__cf_chl",
+    "cf_chl_opt",
+    "challenge-platform",
+    "/cdn-cgi/challenge-platform",
+)
+
+
+def _is_cf_challenge(resp) -> bool:
+    """True if resp is a Cloudflare interstitial/JS challenge (403 or 503).
+
+    Works on HEAD responses (header check only — no body transmitted) and on
+    streamed GET responses (reads up to 4 KB of the body for marker detection).
+    """
+    if resp.status_code not in (403, 503):
+        return False
+    if "cloudflare" not in resp.headers.get("server", "").lower():
+        return False
+    if resp.headers.get("cf-mitigated", "").lower() == "challenge":
+        return True
+    # HEAD responses: raw.read() safely returns b"" (no body).
+    # Streamed GET responses: read a small snippet before the caller closes.
+    try:
+        snippet = resp.raw.read(4096, decode_content=True).decode("utf-8", "replace").lower()
+    except Exception:
+        snippet = ""
+    return any(m in snippet for m in CF_CHALLENGE_MARKERS)
 
 
 def _handle_interrupt(sig, frame):
@@ -246,23 +278,31 @@ def test_url(url, timeout):
     def _fetch(u):
         try:
             resp = requests.head(u, timeout=timeout, allow_redirects=True, headers=headers)
-            if resp.status_code in (403, 405):
+            if resp.status_code in (403, 405, 503):
+                # Fast CF detection from HEAD headers (no body on HEAD).
+                if _is_cf_challenge(resp):
+                    return None, None, "Cloudflare challenge"
+                # Fallback to GET for servers that reject/misbehave on HEAD.
                 resp = requests.get(
                     u, timeout=timeout, allow_redirects=True, headers=headers, stream=True
                 )
+                # Read snippet BEFORE close so _is_cf_challenge can inspect body.
+                is_cf = _is_cf_challenge(resp)
                 resp.close()
-            return resp.status_code, None
+                if is_cf:
+                    return None, None, "Cloudflare challenge"
+            return resp.status_code, None, None
         except RequestException as e:
-            return None, _classify_error(e)
+            return None, _classify_error(e), None
 
-    code, error = _fetch(url)
+    code, error, note = _fetch(url)
 
-    if code == 403 and url.startswith("http:"):
-        https_code, https_error = _fetch("https:" + url[5:])
+    if code == 403 and note is None and url.startswith("http:"):
+        https_code, https_error, https_note = _fetch("https:" + url[5:])
         if https_code is not None and 200 <= https_code < 300:
             return 200, None, "HTTPS upgrade required"
 
-    return code, error, None
+    return code, error, note
 
 
 def _status_class(code, error=None):

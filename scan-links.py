@@ -1,0 +1,534 @@
+#!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "pymysql>=1.1.0",
+#     "requests>=2.31.0",
+#     "rich>=13.0.0",
+# ]
+# ///
+"""
+Scan WordPress posts and pages for external URLs.
+
+Usage:
+    uv run scan-links.py [options]
+
+    --wp-config FILE      Path to wp-config.php (default: next to this script)
+    --output FILE.html    Write results to HTML file (default: console)
+    --test                Test each URL for accessibility
+    --timeout N           HTTP timeout in seconds (default: 10)
+
+Interrupt testing with Ctrl+C — partial results will still be output.
+"""
+
+import argparse
+import html as html_lib
+import re
+import signal
+import sys
+from collections import defaultdict, deque
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import urlparse
+
+import ssl as _ssl
+
+import pymysql
+import pymysql.cursors
+import requests
+from requests.exceptions import (
+    RequestException,
+    ConnectionError as RequestsConnectionError,
+    SSLError as RequestsSSLError,
+    ConnectTimeout,
+    ReadTimeout,
+    Timeout,
+    TooManyRedirects,
+)
+from rich.console import Console
+
+console = Console(stderr=True)
+
+
+def parse_wp_config(config_path: Path) -> dict:
+    """
+    Parse DB constants and table prefix from a wp-config.php file.
+    Follows local include: if local/wp-config.php exists alongside the main
+    file, parse it first so its defines take precedence (matching PHP behaviour).
+    """
+    define_re = re.compile(
+        r"""define\s*\(\s*['"](\w+)['"]\s*,\s*['"]([^'"]*)['"]\s*\)""",
+        re.IGNORECASE,
+    )
+    prefix_re = re.compile(r"""\$table_prefix\s*=\s*['"]([^'"]+)['"]\s*;""")
+
+    values: dict[str, str] = {}
+
+    def _parse_file(path: Path) -> None:
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for m in define_re.finditer(text):
+            key, val = m.group(1), m.group(2)
+            if key not in values:
+                values[key] = val
+        if "table_prefix" not in values:
+            m = prefix_re.search(text)
+            if m:
+                values["table_prefix"] = m.group(1)
+
+    # Check for local override (mirrors the PHP include logic)
+    local_config = config_path.parent / "local" / "wp-config.php"
+    if local_config.exists():
+        _parse_file(local_config)
+
+    _parse_file(config_path)
+    return values
+
+# Match href/src attributes and CSS url() values containing absolute URLs
+URL_PATTERNS = [
+    re.compile(r'''(?:href|src|action)\s*=\s*["'](https?://[^"']+)["']''', re.IGNORECASE),
+    re.compile(r'''url\(["']?(https?://[^"')]+)["']?\)''', re.IGNORECASE),
+]
+
+_interrupted = False
+
+
+def _handle_interrupt(sig, frame):
+    global _interrupted
+    console.print("\n[yellow]Interrupted — saving results so far...[/yellow]")
+    _interrupted = True
+
+
+def get_connection(cfg: dict):
+    return pymysql.connect(
+        host=cfg["DB_HOST"],
+        user=cfg["DB_USER"],
+        password=cfg["DB_PASSWORD"],
+        database=cfg["DB_NAME"],
+        charset="utf8mb4",
+        cursorclass=pymysql.cursors.DictCursor,
+    )
+
+
+def get_site_url(conn, prefix) -> str:
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT option_value FROM {prefix}options WHERE option_name = 'siteurl'"
+        )
+        row = cur.fetchone()
+        if not row or not row["option_value"]:
+            console.print("[red]Error:[/red] siteurl not found in wp_options.")
+            sys.exit(1)
+        return row["option_value"].rstrip("/")
+
+
+def fetch_posts(conn, prefix):
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT ID, post_title, post_type, post_content
+            FROM {prefix}posts
+            WHERE post_status = 'publish'
+              AND post_type IN ('post', 'page')
+            ORDER BY ID
+        """)
+        return cur.fetchall()
+
+
+def extract_urls(content):
+    urls = set()
+    for pattern in URL_PATTERNS:
+        for m in pattern.finditer(content or ""):
+            url = m.group(1).rstrip(".,;)")  # strip trailing punctuation
+            urls.add(url)
+    return urls
+
+
+def is_external(url, site_host):
+    try:
+        host = urlparse(url).netloc.lower().split(":")[0]
+        return bool(host) and host != site_host
+    except Exception:
+        return False
+
+
+def collect_urls(posts, site_url, site_host):
+    """Return sorted list of (url, [(post_id, title, post_url), ...])."""
+    url_refs: dict[str, list] = defaultdict(list)
+    for post in posts:
+        post_url = f"{site_url}/?p={post['ID']}"
+        ref = (post["ID"], post["post_title"] or f"(ID {post['ID']})", post_url)
+        for url in extract_urls(post["post_content"]):
+            if is_external(url, site_host):
+                if ref not in url_refs[url]:
+                    url_refs[url].append(ref)
+    return sorted(url_refs.items())
+
+
+def _classify_error(exc: RequestException) -> str:
+    """Return a short, human-readable description of a requests exception."""
+    if isinstance(exc, ConnectTimeout):
+        return "Connect timeout"
+    if isinstance(exc, ReadTimeout):
+        return "Read timeout"
+    if isinstance(exc, Timeout):
+        return "Timeout"
+    if isinstance(exc, TooManyRedirects):
+        return "Too many redirects"
+
+    msg = str(exc)
+
+    if isinstance(exc, RequestsSSLError):
+        # Extract the human-readable part after the [SSL: REASON] code:
+        # e.g. "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: unable to get local issuer certificate (_ssl.c:1006)"
+        m = re.search(r'\[SSL: [A-Z_]+\]\s*([^(]+?)(?:\s*\(_ssl\.c|$)', msg)
+        if m:
+            detail = m.group(1).strip().rstrip("')")
+            if detail:
+                return f"SSL: {detail}"
+        # Fallback: look for the ssl.SSLError in the exception chain
+        cause = exc.__context__
+        while cause is not None:
+            if isinstance(cause, _ssl.SSLError) and cause.reason:
+                return f"SSL: {cause.reason.replace('_', ' ').lower()}"
+            cause = getattr(cause, "__context__", None)
+        return "SSL error"
+
+    if isinstance(exc, RequestsConnectionError):
+        if any(x in msg for x in (
+            "nodename nor servname provided",
+            "Name or service not known",
+            "getaddrinfo failed",
+            "No address associated with hostname",
+            "Temporary failure in name resolution",
+        )):
+            return "DNS failure: host not found"
+        if "Connection refused" in msg:
+            return "Connection refused"
+        if "RemoteDisconnected" in msg or "Connection reset by peer" in msg:
+            return "Connection reset by server"
+        if "timed out" in msg.lower():
+            return "Connection timed out"
+        m = re.search(r"Failed to establish a new connection:\s*(.+?)(?:'\)|\"|$)", msg)
+        if m:
+            return f"Connection failed: {m.group(1).strip()[:80]}"
+        return "Connection error"
+
+    return str(exc)[:120]
+
+
+def test_url(url, timeout):
+    """Returns (status_code_or_None, error_string_or_None, note_or_None)."""
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; link-checker/1.0)"}
+
+    def _fetch(u):
+        try:
+            resp = requests.head(u, timeout=timeout, allow_redirects=True, headers=headers)
+            if resp.status_code == 405:
+                resp = requests.get(
+                    u, timeout=timeout, allow_redirects=True, headers=headers, stream=True
+                )
+                resp.close()
+            return resp.status_code, None
+        except RequestException as e:
+            return None, _classify_error(e)
+
+    code, error = _fetch(url)
+
+    if code == 403 and url.startswith("http:"):
+        https_code, https_error = _fetch("https:" + url[5:])
+        if https_code is not None and 200 <= https_code < 300:
+            return 200, None, "HTTPS upgrade required"
+
+    return code, error, None
+
+
+def _status_class(code):
+    if code is None:
+        return "fail"
+    if 200 <= code < 300:
+        return "ok"
+    if 300 <= code < 400:
+        return "redirect"
+    return "fail"
+
+
+def _status_label(code, error):
+    if error:
+        return "ERROR"
+    return str(code)
+
+
+def esc(s):
+    return html_lib.escape(str(s))
+
+
+# ── Console output ────────────────────────────────────────────────────────────
+
+def print_console_list(url_list, test_results=None):
+    for url, refs in url_list:
+        if test_results is not None:
+            if url in test_results:
+                code, error, note = test_results[url]
+                if error:
+                    status = f"[red]ERROR[/red] [dim]{error}[/dim]"
+                else:
+                    color = "green" if 200 <= code < 300 else ("yellow" if 300 <= code < 400 else "red")
+                    suffix = f" [dim]({note})[/dim]" if note else ""
+                    status = f"[{color}]{code}[/{color}]{suffix}"
+            else:
+                status = "[dim]—[/dim]"
+            console.print(f"{status}  [bold]{url}[/bold]")
+        else:
+            console.print(f"[bold]{url}[/bold]")
+
+        for _, title, post_url in refs:
+            console.print(f"     [dim]↳ {title}[/dim]  [blue]{post_url}[/blue]")
+        console.print()
+
+
+# ── HTML output ───────────────────────────────────────────────────────────────
+
+_HTML_STYLE = """
+body { font-family: system-ui, -apple-system, sans-serif; font-size: 14px;
+       padding: 1.5rem 2rem; color: #222; max-width: 1400px; margin: 0 auto; }
+h1 { font-size: 1.25rem; margin-bottom: 0.2rem; }
+.meta { color: #666; font-size: 0.85rem; margin-bottom: 1.5rem; }
+table { border-collapse: collapse; width: 100%; table-layout: fixed; }
+col.url { width: 45%; }
+col.status { width: 7%; }
+col.refs { width: 48%; }
+col.refs-only { width: 55%; }
+th { text-align: left; padding: 0.5rem 0.75rem; background: #f0f0f0;
+     border-bottom: 2px solid #ccc; position: sticky; top: 0; }
+td { padding: 0.4rem 0.75rem; border-bottom: 1px solid #e8e8e8;
+     vertical-align: top; word-break: break-all; }
+tr.ok td { background: #f6fff6; }
+tr.fail td { background: #fff5f5; }
+tr.redirect td { background: #fffbe6; }
+.ok { color: #1a7a1a; font-weight: bold; }
+.fail, .error { color: #c00; font-weight: bold; }
+.redirect { color: #8a5a00; font-weight: bold; }
+.untested { color: #aaa; }
+small { display: block; color: #777; font-size: 0.8em; word-break: break-all; }
+a.ext { color: #1155cc; }
+a.post { color: #555; font-size: 0.88em; }
+a.edit { color: #999; font-size: 0.8em; margin-left: 0.4em; }
+a.edit:hover { color: #1155cc; }
+.refs { display: flex; flex-direction: column; gap: 2px; }
+.ref-item { display: flex; align-items: baseline; gap: 0; }
+"""
+
+def write_html(url_list, output_file, test_results=None, site_url=None):
+    has_test = test_results is not None
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    title = "WordPress External Links"
+    if has_test:
+        title += " — Test Results"
+    tested_count = len(test_results) if test_results else 0
+    fail_count = sum(
+        1 for code, err in (test_results or {}).values()
+        if err or (code is not None and code >= 400)
+    )
+
+    if has_test:
+        col_defs = '<col class="url"><col class="status"><col class="refs">'
+        header = "<tr><th>URL</th><th>Status</th><th>Referenced By</th></tr>"
+    else:
+        col_defs = '<col class="url"><col class="refs-only">'
+        header = "<tr><th>URL</th><th>Referenced By</th></tr>"
+
+    rows = []
+    for url, refs in url_list:
+        ref_html = '<div class="refs">' + "".join(
+            f'<span class="ref-item">'
+            f'<a class="post" href="{esc(pu)}" target="_blank">{esc(t)}</a>'
+            f'<a class="edit" href="{esc(site_url)}/wp-admin/post.php?post={pid}&action=edit" target="_blank">(edit)</a>'
+            f'</span>'
+            for pid, t, pu in refs
+        ) + "</div>"
+
+        if has_test:
+            if url not in test_results:
+                status_html = '<span class="untested">—</span>'
+                row_class = ""
+            else:
+                code, error, note = test_results[url]
+                cls = _status_class(code)
+                label = _status_label(code, error)
+                extra = f"<small>{esc(error[:120])}</small>" if error else (f"<small>{esc(note)}</small>" if note else "")
+                status_html = f'<span class="{cls}">{label}</span>{extra}'
+                row_class = f' class="{cls}"'
+            rows.append(
+                f'<tr{row_class}>'
+                f'<td><a class="ext" href="{esc(url)}" target="_blank">{esc(url)}</a></td>'
+                f'<td>{status_html}</td>'
+                f'<td>{ref_html}</td>'
+                f"</tr>"
+            )
+        else:
+            rows.append(
+                f"<tr>"
+                f'<td><a class="ext" href="{esc(url)}" target="_blank">{esc(url)}</a></td>'
+                f'<td>{ref_html}</td>'
+                f"</tr>"
+            )
+
+    meta_parts = [
+        f"{len(url_list)} URLs",
+        f"site: {esc(site_url)}" if site_url else "",
+    ]
+    if has_test:
+        meta_parts += [f"{tested_count} tested", f"{fail_count} failed/error"]
+    meta = " &nbsp;·&nbsp; ".join(p for p in meta_parts if p)
+
+    page = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{esc(title)}</title>
+<style>{_HTML_STYLE}</style>
+</head>
+<body>
+<h1>{esc(title)}</h1>
+<p class="meta">Generated {timestamp} &nbsp;·&nbsp; {meta}</p>
+<table>
+<colgroup>{col_defs}</colgroup>
+<thead>{header}</thead>
+<tbody>
+{"".join(rows)}
+</tbody>
+</table>
+</body>
+</html>
+"""
+    Path(output_file).write_text(page, encoding="utf-8")
+    console.print(f"[green]Written:[/green] {output_file}")
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    signal.signal(signal.SIGINT, _handle_interrupt)
+
+    script_dir = Path(__file__).resolve().parent
+
+    parser = argparse.ArgumentParser(
+        description="Scan WordPress posts/pages for external URLs.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--wp-config", metavar="FILE",
+        default=str(script_dir / "wp-config.php"),
+        help="Path to wp-config.php (default: wp-config.php next to this script)",
+    )
+    parser.add_argument(
+        "--output", metavar="FILE.html",
+        help="Write results to HTML file (default: console)",
+    )
+    parser.add_argument(
+        "--test", action="store_true",
+        help="Test each URL and report HTTP status",
+    )
+    parser.add_argument(
+        "--timeout", type=float, default=10, metavar="SECS",
+        help="HTTP request timeout in seconds (default: 10)",
+    )
+    args = parser.parse_args()
+
+    # Load config
+    config_path = Path(args.wp_config)
+    if not config_path.exists():
+        console.print(f"[red]Error:[/red] wp-config.php not found: {config_path}")
+        sys.exit(1)
+    cfg = parse_wp_config(config_path)
+    for key in ("DB_HOST", "DB_USER", "DB_PASSWORD", "DB_NAME"):
+        if key not in cfg:
+            console.print(f"[red]Error:[/red] {key} not found in {config_path}")
+            sys.exit(1)
+    table_prefix = cfg.get("table_prefix", "wp_")
+
+    # Connect and gather data
+    conn = get_connection(cfg)
+    site_url = get_site_url(conn, table_prefix)
+    site_host = urlparse(site_url).netloc.lower().split(":")[0]
+    console.print(f"[dim]Site: {site_url}[/dim]")
+
+    posts = fetch_posts(conn, table_prefix)
+    console.print(f"[dim]{len(posts)} published posts/pages[/dim]")
+
+    url_list = collect_urls(posts, site_url, site_host)
+    conn.close()
+    console.print(f"[dim]{len(url_list)} unique external URLs[/dim]\n")
+
+    # Test URLs if requested
+    test_results = None
+    if args.test:
+        test_results = {}
+        total = len(url_list)
+        console.print(f"Testing {total} URLs (Ctrl+C to stop and save partial results)\n")
+
+        def _domain(url: str) -> str:
+            return urlparse(url).netloc.lower()
+
+        def _print_status(code, error, note=None) -> None:
+            if error:
+                console.print(f"[red]ERROR[/red] [dim]{error}[/dim]")
+            else:
+                color = "green" if 200 <= code < 300 else ("yellow" if 300 <= code < 400 else "red")
+                suffix = f" [dim]({note})[/dim]" if note else ""
+                console.print(f"[{color}]{code}[/{color}]{suffix}")
+
+        queue: deque[tuple] = deque(
+            (i, url, refs) for i, (url, refs) in enumerate(url_list)
+        )
+        retries: list[tuple] = []   # (orig_index, url, refs) deferred due to 429
+        deferred_domains: set[str] = set()
+        seq = 0  # running count for progress label
+
+        # Phase 1: main queue
+        while queue and not _interrupted:
+            orig_idx, url, refs = queue.popleft()
+            seq += 1
+            console.print(f"[dim][{seq}/{total}][/dim] {url} ", end="")
+            code, error, note = test_url(url, args.timeout)
+
+            if code == 429:
+                domain = _domain(url)
+                deferred_domains.add(domain)
+                retries.append((orig_idx, url, refs))
+                # Sweep remaining queue: pull out all same-domain entries
+                remaining: deque[tuple] = deque()
+                for item in queue:
+                    (retries if _domain(item[1]) == domain else remaining).append(item)
+                queue = remaining
+                console.print("[yellow]429 — rate limited, deferred[/yellow]")
+            else:
+                test_results[url] = (code, error, note)
+                _print_status(code, error, note)
+
+        # Phase 2: retry deferred URLs
+        if retries and not _interrupted:
+            n_domains = len(deferred_domains)
+            console.print(
+                f"\n[bold]Retrying {len(retries)} deferred URL(s) "
+                f"from {n_domains} rate-limited domain(s)[/bold]\n"
+            )
+            for orig_idx, url, refs in retries:
+                if _interrupted:
+                    break
+                console.print(f"[dim][retry][/dim] {url} ", end="")
+                code, error, note = test_url(url, args.timeout)
+                test_results[url] = (code, error, note)
+                _print_status(code, error, note)
+
+        console.print()
+
+    # Output results
+    if args.output:
+        write_html(url_list, args.output, test_results, site_url)
+    else:
+        print_console_list(url_list, test_results)
+
+
+if __name__ == "__main__":
+    main()

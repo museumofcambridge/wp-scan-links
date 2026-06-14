@@ -23,6 +23,7 @@ Interrupt testing with Ctrl+C — partial results will still be output.
 
 import argparse
 import html as html_lib
+from http import HTTPStatus
 import re
 import signal
 import sys
@@ -89,6 +90,8 @@ URL_PATTERNS = [
     re.compile(r'''url\(["']?(https?://[^"')]+)["']?\)''', re.IGNORECASE),
 ]
 
+_TITLE_RE = re.compile(r'<title[^>]*>([^<]{1,200})</title>', re.IGNORECASE)
+
 _interrupted = False
 
 # Domains that require a real browser session (Cloudflare, login walls, etc.)
@@ -127,11 +130,11 @@ CF_CHALLENGE_MARKERS = (
 )
 
 
-def _is_cf_challenge(resp) -> bool:
+def _is_cf_challenge(resp, body: str = "") -> bool:
     """True if resp is a Cloudflare interstitial/JS challenge (403 or 503).
 
-    Works on HEAD responses (header check only — no body transmitted) and on
-    streamed GET responses (reads up to 4 KB of the body for marker detection).
+    Pass a pre-read `body` string when the caller has already consumed the
+    response stream. When omitted, reads up to 4 KB (safe on HEAD — returns "").
     """
     if resp.status_code not in (403, 503):
         return False
@@ -139,13 +142,30 @@ def _is_cf_challenge(resp) -> bool:
         return False
     if resp.headers.get("cf-mitigated", "").lower() == "challenge":
         return True
-    # HEAD responses: raw.read() safely returns b"" (no body).
-    # Streamed GET responses: read a small snippet before the caller closes.
-    try:
-        snippet = resp.raw.read(4096, decode_content=True).decode("utf-8", "replace").lower()
-    except Exception:
-        snippet = ""
-    return any(m in snippet for m in CF_CHALLENGE_MARKERS)
+    if not body:
+        try:
+            body = resp.raw.read(4096, decode_content=True).decode("utf-8", "replace")
+        except Exception:
+            body = ""
+    return any(m in body.lower() for m in CF_CHALLENGE_MARKERS)
+
+
+def _extract_403_reason(body: str) -> str | None:
+    """Extract a short human-readable reason from a 403 response body.
+
+    Tries the <title> tag; strips generic/redundant terms so only the
+    site-specific part remains (e.g. 'JSTOR: Access Check', 'Peterhouse').
+    Returns None when nothing informative is found.
+    """
+    m = _TITLE_RE.search(body)
+    if not m:
+        return None
+    title = html_lib.unescape(m.group(1)).strip()
+    # Remove noise: leading/trailing code/phrase, pipe-separated site names, etc.
+    title = re.sub(r'^\s*403\s*[-–|:]*\s*', '', title, flags=re.IGNORECASE)
+    title = re.sub(r'\b(forbidden|error)\b[\s\-–|:]*', '', title, flags=re.IGNORECASE)
+    title = re.sub(r'\s+', ' ', title).strip(' -–|:')
+    return title[:80] if title else None
 
 
 def _handle_interrupt(sig, frame):
@@ -286,11 +306,18 @@ def test_url(url, timeout):
                 resp = requests.get(
                     u, timeout=timeout, allow_redirects=True, headers=headers, stream=True
                 )
-                # Read snippet BEFORE close so _is_cf_challenge can inspect body.
-                is_cf = _is_cf_challenge(resp)
+                # Read body once — used for CF detection and 403 reason extraction.
+                body = ""
+                if resp.status_code in (403, 503):
+                    try:
+                        body = resp.raw.read(4096, decode_content=True).decode("utf-8", "replace")
+                    except Exception:
+                        pass
                 resp.close()
-                if is_cf:
+                if _is_cf_challenge(resp, body):
                     return None, None, "Cloudflare challenge"
+                note = _extract_403_reason(body) if resp.status_code == 403 else None
+                return resp.status_code, None, note
             return resp.status_code, None, None
         except RequestException as e:
             return None, _classify_error(e), None
@@ -303,6 +330,39 @@ def test_url(url, timeout):
             return 200, None, "HTTPS upgrade required"
 
     return code, error, note
+
+
+# Codes well-known enough that showing just the number is sufficient.
+_COMMON_HTTP_CODES = frozenset({
+    200, 201, 204,
+    301, 302, 303, 304, 307, 308,
+    400, 401, 403, 404, 405, 408, 409, 410, 422, 429,
+    500, 501, 502, 503, 504,
+})
+# Cloudflare-specific codes not in the stdlib HTTPStatus enum.
+_EXTRA_STATUS_NAMES = {
+    520: "Unknown Error",
+    521: "Web Server Down",
+    522: "Connection Timed Out",
+    523: "Origin Unreachable",
+    524: "Timeout Occurred",
+    525: "SSL Handshake Failed",
+    526: "Invalid SSL Certificate",
+    527: "Railgun Error",
+    530: "Site Frozen",
+}
+
+
+def _status_reason(code: int) -> str | None:
+    """Return a reason phrase for uncommon codes, None for well-known ones."""
+    if code in _COMMON_HTTP_CODES:
+        return None
+    if code in _EXTRA_STATUS_NAMES:
+        return _EXTRA_STATUS_NAMES[code]
+    try:
+        return HTTPStatus(code).phrase
+    except ValueError:
+        return None
 
 
 def _status_class(code, error=None):
@@ -320,7 +380,8 @@ def _status_label(code, error):
         return "ERROR"
     if code is None:
         return "SKIP"
-    return str(code)
+    reason = _status_reason(code)
+    return f"{code} {reason}" if reason else str(code)
 
 
 def esc(s):
@@ -553,8 +614,9 @@ def main():
                 console.print(f"[dim]SKIP ({note})[/dim]")
             else:
                 color = "green" if 200 <= code < 300 else ("yellow" if 300 <= code < 400 else "red")
+                label = _status_label(code, None)
                 suffix = f" [dim]({note})[/dim]" if note else ""
-                console.print(f"[{color}]{code}[/{color}]{suffix}")
+                console.print(f"[{color}]{label}[/{color}]{suffix}")
 
         queue: deque[tuple] = deque(
             (i, url, refs) for i, (url, refs) in enumerate(url_list)

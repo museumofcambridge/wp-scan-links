@@ -209,12 +209,23 @@ def fetch_posts(conn, prefix):
         return cur.fetchall()
 
 
+def _strip_url_punct(url: str) -> str:
+    """Strip trailing punctuation, keeping ) when it closes an unmatched (."""
+    while True:
+        prev = url
+        url = url.rstrip(".,;")
+        if url.endswith(")") and url.count("(") < url.count(")"):
+            url = url[:-1]
+        if url == prev:
+            break
+    return url
+
+
 def extract_urls(content):
     urls = set()
     for pattern in URL_PATTERNS:
         for m in pattern.finditer(content or ""):
-            url = m.group(1).rstrip(".,;)")  # strip trailing punctuation
-            urls.add(url)
+            urls.add(_strip_url_punct(m.group(1)))
     return urls
 
 

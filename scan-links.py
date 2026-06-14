@@ -91,6 +91,30 @@ URL_PATTERNS = [
 
 _interrupted = False
 
+# Domains that require a real browser session (Cloudflare, login walls, etc.)
+# URLs on these domains are listed but not tested.
+BROWSER_ONLY_DOMAINS = {
+    "ancestry.com",
+    "ancestry.co.uk",
+    "ancestry.com.au",
+    "ancestry.ca",
+    "ancestry.ie",
+    "ancestry.de",
+    "ancestry.fr",
+    "ancestry.it",
+    "ancestry.se",
+    "ancestry.no",
+    "ancestry.dk",
+    "ancestry.mx",
+}
+
+
+def _is_browser_only(url: str) -> bool:
+    host = urlparse(url).netloc.lower().split(":")[0].removeprefix("www.")
+    return host in BROWSER_ONLY_DOMAINS or any(
+        host.endswith("." + d) for d in BROWSER_ONLY_DOMAINS
+    )
+
 
 def _handle_interrupt(sig, frame):
     global _interrupted
@@ -241,9 +265,9 @@ def test_url(url, timeout):
     return code, error, None
 
 
-def _status_class(code):
+def _status_class(code, error=None):
     if code is None:
-        return "fail"
+        return "fail" if error else "skip"
     if 200 <= code < 300:
         return "ok"
     if 300 <= code < 400:
@@ -254,6 +278,8 @@ def _status_class(code):
 def _status_label(code, error):
     if error:
         return "ERROR"
+    if code is None:
+        return "SKIP"
     return str(code)
 
 
@@ -270,6 +296,8 @@ def print_console_list(url_list, test_results=None):
                 code, error, note = test_results[url]
                 if error:
                     status = f"[red]ERROR[/red] [dim]{error}[/dim]"
+                elif code is None:
+                    status = f"[dim]SKIP ({note})[/dim]"
                 else:
                     color = "green" if 200 <= code < 300 else ("yellow" if 300 <= code < 400 else "red")
                     suffix = f" [dim]({note})[/dim]" if note else ""
@@ -308,6 +336,8 @@ tr.redirect td { background: #fffbe6; }
 .fail, .error { color: #c00; font-weight: bold; }
 .redirect { color: #8a5a00; font-weight: bold; }
 .untested { color: #aaa; }
+.skip { color: #888; }
+tr.skip td { background: #f8f8f8; }
 small { display: block; color: #777; font-size: 0.8em; word-break: break-all; }
 a.ext { color: #1155cc; }
 a.post { color: #555; font-size: 0.88em; }
@@ -325,8 +355,12 @@ def write_html(url_list, output_file, test_results=None, site_url=None):
         title += " — Test Results"
     tested_count = len(test_results) if test_results else 0
     fail_count = sum(
-        1 for code, err in (test_results or {}).values()
+        1 for code, err, note in (test_results or {}).values()
         if err or (code is not None and code >= 400)
+    )
+    skip_count = sum(
+        1 for code, err, note in (test_results or {}).values()
+        if code is None and not err
     )
 
     if has_test:
@@ -352,7 +386,7 @@ def write_html(url_list, output_file, test_results=None, site_url=None):
                 row_class = ""
             else:
                 code, error, note = test_results[url]
-                cls = _status_class(code)
+                cls = _status_class(code, error)
                 label = _status_label(code, error)
                 extra = f"<small>{esc(error[:120])}</small>" if error else (f"<small>{esc(note)}</small>" if note else "")
                 status_html = f'<span class="{cls}">{label}</span>{extra}'
@@ -377,7 +411,9 @@ def write_html(url_list, output_file, test_results=None, site_url=None):
         f"site: {esc(site_url)}" if site_url else "",
     ]
     if has_test:
-        meta_parts += [f"{tested_count} tested", f"{fail_count} failed/error"]
+        meta_parts += [f"{tested_count - skip_count} tested", f"{fail_count} failed/error"]
+        if skip_count:
+            meta_parts.append(f"{skip_count} skipped (browser-only)")
     meta = " &nbsp;·&nbsp; ".join(p for p in meta_parts if p)
 
     page = f"""<!DOCTYPE html>
@@ -473,6 +509,8 @@ def main():
         def _print_status(code, error, note=None) -> None:
             if error:
                 console.print(f"[red]ERROR[/red] [dim]{error}[/dim]")
+            elif code is None:
+                console.print(f"[dim]SKIP ({note})[/dim]")
             else:
                 color = "green" if 200 <= code < 300 else ("yellow" if 300 <= code < 400 else "red")
                 suffix = f" [dim]({note})[/dim]" if note else ""
@@ -490,6 +528,12 @@ def main():
             orig_idx, url, refs = queue.popleft()
             seq += 1
             console.print(f"[dim][{seq}/{total}][/dim] {url} ", end="")
+
+            if _is_browser_only(url):
+                console.print("[dim]SKIP (browser-only)[/dim]")
+                test_results[url] = (None, None, "browser-only")
+                continue
+
             code, error, note = test_url(url, args.timeout)
 
             if code == 429:

@@ -109,7 +109,22 @@ BROWSER_ONLY_DOMAINS = {
     "ancestry.no",
     "ancestry.dk",
     "ancestry.mx",
+    "sciencedirect.com",
     "freepages.rootsweb.com",
+    # wikipedia links can be tested however there are a large nunber
+    # of them so we hit 429 (rate limiting) quickly. Since wikipedia
+    # links are persistent and reliable then we don't need to test them
+    "en.wikipedia.org",
+    # cemetery links can be tested however there are a large number of
+    # them. No rate limiting is done but we don't want to stress the
+    # site and the links are persistent and reliable
+    "millroadcemetery.org.uk",
+    # historicengland uses cloudflare protectoin so can't be checked
+    # by the script
+    "historicengland.org.uk",
+    # archive.org refuses connections agter a few fetches and links
+    # there are stable so don't need testing
+    "web.archive.org",
 }
 
 

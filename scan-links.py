@@ -8,15 +8,23 @@
 # ]
 # ///
 """
-Scan WordPress posts and pages for external URLs.
+Scan WordPress posts and pages for external URLs and embeds.
 
 Usage:
     uv run scan-links.py [options]
 
     --wp-config FILE      Path to wp-config.php (default: next to this script)
     --output FILE.html    Write results to HTML file (default: console)
-    --test                Test each URL for accessibility
+    --test                Test each URL for accessibility and embed permissions
     --timeout N           HTTP timeout in seconds (default: 10)
+
+Detects:
+  - Regular external URLs (href, src, action attributes, CSS url())
+  - Embed URLs (iframe src, embed src, object data)
+
+When testing embeds, checks that:
+  - The resource exists (HTTP 200)
+  - Embedding is allowed (X-Frame-Options and CSP headers)
 
 Interrupt testing with Ctrl+C — partial results will still be output.
 """
@@ -88,6 +96,17 @@ def parse_wp_config(config_path: Path) -> dict:
 URL_PATTERNS = [
     re.compile(r'''(?:href|src|action)\s*=\s*["'](https?://[^"']+)["']''', re.IGNORECASE),
     re.compile(r'''url\(["']?(https?://[^"')]+)["']?\)''', re.IGNORECASE),
+    # Match bare URLs (on their own line or surrounded by whitespace)
+    re.compile(r'(?:^|\s)(https?://[^\s<>"{}|\\^`\[\]]+)(?:\s|$)', re.MULTILINE),
+]
+
+# Match URLs in embed-specific attributes (data for <object>, src for <iframe>/<embed>)
+EMBED_PATTERNS = [
+    re.compile(r'''<iframe[^>]+src\s*=\s*["'](https?://[^"']+)["']''', re.IGNORECASE),
+    re.compile(r'''<embed[^>]+src\s*=\s*["'](https?://[^"']+)["']''', re.IGNORECASE),
+    re.compile(r'''<object[^>]+data\s*=\s*["'](https?://[^"']+)["']''', re.IGNORECASE),
+    # Match bare URLs used as embeds
+    re.compile(r'(?:^|\s)(https?://[^\s<>"{}|\\^`\[\]]+)(?:\s|$)', re.MULTILINE),
 ]
 
 _TITLE_RE = re.compile(r'<title[^>]*>([^<]{1,200})</title>', re.IGNORECASE)
@@ -244,6 +263,15 @@ def extract_urls(content):
     return urls
 
 
+def extract_embed_urls(content):
+    """Extract URLs used for embedding (iframe, embed, object)."""
+    urls = set()
+    for pattern in EMBED_PATTERNS:
+        for m in pattern.finditer(content or ""):
+            urls.add(_strip_url_punct(m.group(1)))
+    return urls
+
+
 def is_external(url, site_host):
     try:
         host = urlparse(url).netloc.lower().split(":")[0]
@@ -253,15 +281,26 @@ def is_external(url, site_host):
 
 
 def collect_urls(posts, site_url, site_host):
-    """Return sorted list of (url, [(post_id, title, post_url), ...])."""
+    """Return sorted list of (url, [(post_id, title, post_url, is_embed), ...])."""
     url_refs: dict[str, list] = defaultdict(list)
     for post in posts:
         post_url = f"{site_url}/?p={post['ID']}"
-        ref = (post["ID"], post["post_title"] or f"(ID {post['ID']})", post_url)
+        ref_base = (post["ID"], post["post_title"] or f"(ID {post['ID']})", post_url)
+
+        # Collect regular URLs
         for url in extract_urls(post["post_content"]):
             if is_external(url, site_host):
+                ref = ref_base + (False,)  # False = not an embed
                 if ref not in url_refs[url]:
                     url_refs[url].append(ref)
+
+        # Collect embed URLs
+        for url in extract_embed_urls(post["post_content"]):
+            if is_external(url, site_host):
+                ref = ref_base + (True,)  # True = is an embed
+                if ref not in url_refs[url]:
+                    url_refs[url].append(ref)
+
     return sorted(url_refs.items())
 
 
@@ -358,6 +397,66 @@ def test_url(url, timeout):
     return code, error, note
 
 
+def _check_embed_allowed(resp, url: str) -> str | None:
+    """Check if URL can be embedded based on security headers.
+
+    Returns None if embedding is allowed, otherwise returns reason embedding is blocked.
+    """
+    # Check X-Frame-Options header
+    x_frame = resp.headers.get("X-Frame-Options", "").strip().upper()
+    if x_frame == "DENY":
+        return "X-Frame-Options: DENY"
+    if x_frame == "SAMEORIGIN":
+        try:
+            req_host = urlparse(url).netloc.lower()
+            return "X-Frame-Options: SAMEORIGIN (may block if parent differs)"
+        except Exception:
+            return "X-Frame-Options: SAMEORIGIN"
+
+    # Check Content-Security-Policy frame-ancestors
+    csp = resp.headers.get("Content-Security-Policy", "")
+    if "frame-ancestors" in csp.lower():
+        frame_ancestors = re.search(r"frame-ancestors\s+([^;]+)", csp, re.IGNORECASE)
+        if frame_ancestors:
+            policy = frame_ancestors.group(1).strip()
+            if policy == "'none'":
+                return "CSP frame-ancestors: 'none'"
+            # If it doesn't include 'self' or '*' or our site, it might block
+            if "'self'" not in policy and "*" not in policy:
+                return f"CSP frame-ancestors: {policy[:60]}"
+
+    return None
+
+
+def test_embed_url(url, timeout):
+    """Test if a URL exists and can be embedded. Returns (status_code_or_None, error_string_or_None, embed_note_or_None)."""
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; link-checker/1.0)"}
+
+    try:
+        resp = requests.head(url, timeout=timeout, allow_redirects=True, headers=headers)
+
+        if resp.status_code in (403, 405, 503):
+            resp = requests.get(
+                url, timeout=timeout, allow_redirects=True, headers=headers, stream=True
+            )
+            body = ""
+            if resp.status_code in (403, 503):
+                try:
+                    body = resp.raw.read(4096, decode_content=True).decode("utf-8", "replace")
+                except Exception:
+                    pass
+            resp.close()
+
+        # Check if URL exists and can be embedded
+        if resp.status_code and 200 <= resp.status_code < 300:
+            embed_note = _check_embed_allowed(resp, url)
+            return resp.status_code, None, embed_note
+        else:
+            return resp.status_code, None, None
+    except RequestException as e:
+        return None, _classify_error(e), None
+
+
 # Codes well-known enough that showing just the number is sufficient.
 _COMMON_HTTP_CODES = frozenset({
     200, 201, 204,
@@ -435,8 +534,11 @@ def print_console_list(url_list, test_results=None):
         else:
             console.print(f"[bold]{url}[/bold]")
 
-        for _, title, post_url in refs:
-            console.print(f"     [dim]↳ {title}[/dim]  [blue]{post_url}[/blue]")
+        for ref in refs:
+            _, title, post_url, *is_embed_list = ref
+            is_embed = is_embed_list[0] if is_embed_list else False
+            embed_label = " [yellow][EMBED][/yellow]" if is_embed else ""
+            console.print(f"     [dim]↳ {title}[/dim]{embed_label}  [blue]{post_url}[/blue]")
         console.print()
 
 
@@ -471,7 +573,8 @@ a.post { color: #555; font-size: 0.88em; }
 a.edit { color: #999; font-size: 0.8em; margin-left: 0.4em; }
 a.edit:hover { color: #1155cc; }
 .refs { display: flex; flex-direction: column; gap: 2px; }
-.ref-item { display: flex; align-items: baseline; gap: 0; }
+.ref-item { display: flex; align-items: baseline; gap: 4px; }
+.embed-badge { background: #fff3cd; color: #856404; padding: 2px 6px; border-radius: 3px; font-size: 0.75em; font-weight: bold; }
 """
 
 def write_html(url_list, output_file, test_results=None, site_url=None):
@@ -499,13 +602,17 @@ def write_html(url_list, output_file, test_results=None, site_url=None):
 
     rows = []
     for url, refs in url_list:
-        ref_html = '<div class="refs">' + "".join(
-            f'<span class="ref-item">'
-            f'<a class="post" href="{esc(pu)}" target="_blank">{esc(t)}</a>'
-            f'<a class="edit" href="{esc(site_url)}/wp-admin/post.php?post={pid}&action=edit" target="_blank">(edit)</a>'
-            f'</span>'
-            for pid, t, pu in refs
-        ) + "</div>"
+        def _make_ref_html(ref):
+            pid, t, pu, is_embed = ref[0], ref[1], ref[2], ref[3] if len(ref) > 3 else False
+            embed_badge = '<span class="embed-badge">[EMBED]</span>' if is_embed else ''
+            return (
+                f'<span class="ref-item">'
+                f'<a class="post" href="{esc(pu)}" target="_blank">{esc(t)}</a>'
+                f'{embed_badge}'
+                f'<a class="edit" href="{esc(site_url)}/wp-admin/post.php?post={pid}&action=edit" target="_blank">(edit)</a>'
+                f'</span>'
+            )
+        ref_html = '<div class="refs">' + "".join(_make_ref_html(ref) for ref in refs) + "</div>"
 
         if has_test:
             if url not in test_results:
@@ -644,6 +751,10 @@ def main():
                 suffix = f" [dim]({note})[/dim]" if note else ""
                 console.print(f"[{color}]{label}[/{color}]{suffix}")
 
+        def _has_embed_ref(refs: list) -> bool:
+            """Check if any ref is an embed (4th element is True)."""
+            return any(len(ref) > 3 and ref[3] for ref in refs)
+
         queue: deque[tuple] = deque(
             (i, url, refs) for i, (url, refs) in enumerate(url_list)
         )
@@ -662,7 +773,11 @@ def main():
                 test_results[url] = (None, None, "browser-only")
                 continue
 
-            code, error, note = test_url(url, args.timeout)
+            # Use embed tester if this URL is used for embedding
+            if _has_embed_ref(refs):
+                code, error, note = test_embed_url(url, args.timeout)
+            else:
+                code, error, note = test_url(url, args.timeout)
 
             if code == 429:
                 domain = _domain(url)
@@ -689,7 +804,10 @@ def main():
                 if _interrupted:
                     break
                 console.print(f"[dim][retry][/dim] {url} ", end="")
-                code, error, note = test_url(url, args.timeout)
+                if _has_embed_ref(refs):
+                    code, error, note = test_embed_url(url, args.timeout)
+                else:
+                    code, error, note = test_url(url, args.timeout)
                 test_results[url] = (code, error, note)
                 _print_status(code, error, note)
 

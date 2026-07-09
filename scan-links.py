@@ -397,8 +397,8 @@ def test_url(url, timeout):
     return code, error, note
 
 
-def _check_embed_allowed(resp, url: str) -> str | None:
-    """Check if URL can be embedded based on security headers.
+def _check_embed_allowed(resp, url: str, body: str = "") -> str | None:
+    """Check if URL can be embedded based on security headers and content analysis.
 
     Returns None if embedding is allowed, otherwise returns reason embedding is blocked.
     """
@@ -425,6 +425,25 @@ def _check_embed_allowed(resp, url: str) -> str | None:
             if "'self'" not in policy and "*" not in policy:
                 return f"CSP frame-ancestors: {policy[:60]}"
 
+    # Check for sandbox compatibility issues in content
+    if not body and hasattr(resp, 'raw'):
+        try:
+            body = resp.raw.read(16384, decode_content=True).decode("utf-8", "replace")
+        except Exception:
+            body = ""
+
+    # Look for patterns that commonly break in sandboxed iframes
+    if body:
+        # Check for postMessage usage (often breaks with origin=null in sandboxes)
+        if 'postMessage' in body:
+            pass  # postMessage usage is common, but might indicate iframe incompatibility
+        # Check for window.parent or window.top access (breaks in sandboxes)
+        if re.search(r'window\.(parent|top|opener|frames)', body, re.IGNORECASE):
+            return "Page accesses window.parent/top (breaks in sandboxed iframes)"
+        # Check for reCAPTCHA (often has sandbox issues)
+        if 'recaptcha' in body.lower():
+            return "Page uses reCAPTCHA (may fail in sandboxed iframes)"
+
     return None
 
 
@@ -434,12 +453,23 @@ def test_embed_url(url, timeout):
 
     try:
         resp = requests.head(url, timeout=timeout, allow_redirects=True, headers=headers)
+        body = ""
 
-        if resp.status_code in (403, 405, 503):
+        # For 2xx responses, read body to check for sandbox compatibility issues
+        if resp.status_code and 200 <= resp.status_code < 300:
+            try:
+                get_resp = requests.get(
+                    url, timeout=timeout, allow_redirects=True, headers=headers, stream=True
+                )
+                body = get_resp.raw.read(16384, decode_content=True).decode("utf-8", "replace")
+                get_resp.close()
+            except Exception:
+                pass
+        elif resp.status_code in (403, 405, 503):
+            # Fallback to GET for servers that reject/misbehave on HEAD
             resp = requests.get(
                 url, timeout=timeout, allow_redirects=True, headers=headers, stream=True
             )
-            body = ""
             if resp.status_code in (403, 503):
                 try:
                     body = resp.raw.read(4096, decode_content=True).decode("utf-8", "replace")
@@ -449,7 +479,7 @@ def test_embed_url(url, timeout):
 
         # Check if URL exists and can be embedded
         if resp.status_code and 200 <= resp.status_code < 300:
-            embed_note = _check_embed_allowed(resp, url)
+            embed_note = _check_embed_allowed(resp, url, body)
             return resp.status_code, None, embed_note
         else:
             return resp.status_code, None, None

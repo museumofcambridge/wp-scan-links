@@ -21,6 +21,8 @@ Usage:
 Detects:
   - Regular external URLs (href, src, action attributes, CSS url())
   - Embed URLs (iframe src, embed src, object data)
+  - Bare URLs alone on their own line (treated as embeds); bare URLs that
+    share a line with other text are treated as plain references
 
 When testing embeds, checks that:
   - The resource exists (HTTP 200)
@@ -96,8 +98,6 @@ def parse_wp_config(config_path: Path) -> dict:
 URL_PATTERNS = [
     re.compile(r'''(?:href|src|action)\s*=\s*["'](https?://[^"']+)["']''', re.IGNORECASE),
     re.compile(r'''url\(["']?(https?://[^"')]+)["']?\)''', re.IGNORECASE),
-    # Match bare URLs (on their own line or surrounded by whitespace)
-    re.compile(r'(?:^|\s)(https?://[^\s<>"{}|\\^`\[\]]+)(?:\s|$)', re.MULTILINE),
 ]
 
 # Match URLs in embed-specific attributes (data for <object>, src for <iframe>/<embed>)
@@ -105,9 +105,11 @@ EMBED_PATTERNS = [
     re.compile(r'''<iframe[^>]+src\s*=\s*["'](https?://[^"']+)["']''', re.IGNORECASE),
     re.compile(r'''<embed[^>]+src\s*=\s*["'](https?://[^"']+)["']''', re.IGNORECASE),
     re.compile(r'''<object[^>]+data\s*=\s*["'](https?://[^"']+)["']''', re.IGNORECASE),
-    # Match bare URLs used as embeds
-    re.compile(r'(?:^|\s)(https?://[^\s<>"{}|\\^`\[\]]+)(?:\s|$)', re.MULTILINE),
 ]
+
+# Match bare URLs (on their own line or surrounded by whitespace) — used to find
+# links that aren't already captured by an href/src/etc attribute above.
+BARE_URL_PATTERN = re.compile(r'(?:^|\s)(https?://[^\s<>"{}|\\^`\[\]]+)(?:\s|$)', re.MULTILINE)
 
 _TITLE_RE = re.compile(r'<title[^>]*>([^<]{1,200})</title>', re.IGNORECASE)
 
@@ -272,6 +274,43 @@ def extract_embed_urls(content):
     return urls
 
 
+def extract_bare_urls(content):
+    """Classify bare (non-attribute) URLs by whether the line they're on is
+    otherwise empty.
+
+    A bare URL alone on its own line (once HTML tags and WP block comments
+    are stripped) is treated as an embed. A bare URL that shares its line
+    with other text is just an inline reference, not an embed.
+
+    Returns (embed_urls, reference_urls) — two sets of URLs.
+    """
+    content = content or ""
+    embed_urls = set()
+    reference_urls = set()
+    for m in BARE_URL_PATTERN.finditer(content):
+        raw_url = m.group(1)
+        # Use the captured group's own span, not the full match span — the
+        # surrounding (?:^|\s)/(?:\s|$) delimiters can consume a newline,
+        # which would otherwise pull an adjacent line into the boundaries.
+        url_start, url_end = m.span(1)
+        line_start = content.rfind("\n", 0, url_start) + 1
+        line_end = content.find("\n", url_end)
+        if line_end == -1:
+            line_end = len(content)
+        line = content[line_start:line_end]
+        remainder = line.replace(raw_url, "", 1)
+        remainder = re.sub(r"<!--.*?-->", "", remainder)
+        remainder = re.sub(r"<[^>]+>", "", remainder)
+        remainder = remainder.strip()
+
+        url = _strip_url_punct(raw_url)
+        if remainder:
+            reference_urls.add(url)
+        else:
+            embed_urls.add(url)
+    return embed_urls, reference_urls
+
+
 def is_external(url, site_host):
     try:
         host = urlparse(url).netloc.lower().split(":")[0]
@@ -281,25 +320,33 @@ def is_external(url, site_host):
 
 
 def collect_urls(posts, site_url, site_host):
-    """Return sorted list of (url, [(post_id, title, post_url, is_embed), ...])."""
+    """Return sorted list of (url, [(post_id, title, post_url, is_embed, is_bare_ref), ...])."""
     url_refs: dict[str, list] = defaultdict(list)
     for post in posts:
         post_url = f"{site_url}/?p={post['ID']}"
         ref_base = (post["ID"], post["post_title"] or f"(ID {post['ID']})", post_url)
 
-        # Collect regular URLs
-        for url in extract_urls(post["post_content"]):
+        def _add(url, is_embed, is_bare_ref=False):
             if is_external(url, site_host):
-                ref = ref_base + (False,)  # False = not an embed
+                ref = ref_base + (is_embed, is_bare_ref)
                 if ref not in url_refs[url]:
                     url_refs[url].append(ref)
 
-        # Collect embed URLs
+        # Collect regular URLs (href/src/action attributes, CSS url())
+        for url in extract_urls(post["post_content"]):
+            _add(url, is_embed=False)
+
+        # Collect embed URLs (iframe/embed/object)
         for url in extract_embed_urls(post["post_content"]):
-            if is_external(url, site_host):
-                ref = ref_base + (True,)  # True = is an embed
-                if ref not in url_refs[url]:
-                    url_refs[url].append(ref)
+            _add(url, is_embed=True)
+
+        # Collect bare URLs — only an embed if it's alone on its line;
+        # otherwise it's a plain reference within surrounding text.
+        embed_urls, reference_urls = extract_bare_urls(post["post_content"])
+        for url in embed_urls:
+            _add(url, is_embed=True)
+        for url in reference_urls:
+            _add(url, is_embed=False, is_bare_ref=True)
 
     return sorted(url_refs.items())
 
@@ -565,10 +612,12 @@ def print_console_list(url_list, test_results=None):
             console.print(f"[bold]{url}[/bold]")
 
         for ref in refs:
-            _, title, post_url, *is_embed_list = ref
-            is_embed = is_embed_list[0] if is_embed_list else False
+            _, title, post_url, *rest = ref
+            is_embed = rest[0] if len(rest) > 0 else False
+            is_bare_ref = rest[1] if len(rest) > 1 else False
             embed_label = " [yellow][EMBED][/yellow]" if is_embed else ""
-            console.print(f"     [dim]↳ {title}[/dim]{embed_label}  [blue]{post_url}[/blue]")
+            ref_note = " [dim](bare link, referenced in text — not an embed)[/dim]" if is_bare_ref else ""
+            console.print(f"     [dim]↳ {title}[/dim]{embed_label}{ref_note}  [blue]{post_url}[/blue]")
         console.print()
 
 
@@ -605,6 +654,7 @@ a.edit:hover { color: #1155cc; }
 .refs { display: flex; flex-direction: column; gap: 2px; }
 .ref-item { display: flex; align-items: baseline; gap: 4px; }
 .embed-badge { background: #fff3cd; color: #856404; padding: 2px 6px; border-radius: 3px; font-size: 0.75em; font-weight: bold; }
+.ref-badge { background: #eee; color: #666; padding: 2px 6px; border-radius: 3px; font-size: 0.75em; font-style: italic; }
 """
 
 def write_html(url_list, output_file, test_results=None, site_url=None):
@@ -633,12 +683,15 @@ def write_html(url_list, output_file, test_results=None, site_url=None):
     rows = []
     for url, refs in url_list:
         def _make_ref_html(ref):
-            pid, t, pu, is_embed = ref[0], ref[1], ref[2], ref[3] if len(ref) > 3 else False
+            pid, t, pu = ref[0], ref[1], ref[2]
+            is_embed = ref[3] if len(ref) > 3 else False
+            is_bare_ref = ref[4] if len(ref) > 4 else False
             embed_badge = '<span class="embed-badge">[EMBED]</span>' if is_embed else ''
+            ref_badge = '<span class="ref-badge" title="Bare link surrounded by other text — treated as a reference, not an embed">reference only</span>' if is_bare_ref else ''
             return (
                 f'<span class="ref-item">'
                 f'<a class="post" href="{esc(pu)}" target="_blank">{esc(t)}</a>'
-                f'{embed_badge}'
+                f'{embed_badge}{ref_badge}'
                 f'<a class="edit" href="{esc(site_url)}/wp-admin/post.php?post={pid}&action=edit" target="_blank">(edit)</a>'
                 f'</span>'
             )

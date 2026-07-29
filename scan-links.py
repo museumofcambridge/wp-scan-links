@@ -221,16 +221,43 @@ def get_connection(cfg: dict):
     )
 
 
-def get_site_url(conn, prefix) -> str:
+def get_site_info(conn, prefix, cfg) -> tuple[str, set[str]]:
+    """Return (public site URL, set of internal hostnames).
+
+    The public URL comes from wp_options ('siteurl', falling back to 'home').
+
+    In a decoupled/headless install, WordPress core lets wp-config.php define
+    WP_HOME/WP_SITEURL constants that override the wp_options values at
+    runtime — typically pointing at a separate backend/CMS host while the
+    public-facing domain stays in the database unchanged. Any such constants
+    are folded into the internal-hosts set (already parsed generically by
+    parse_wp_config, so no host name needs to be known in advance) so links
+    to either the public site or its backend are both treated as internal.
+    """
     with conn.cursor() as cur:
         cur.execute(
-            f"SELECT option_value FROM {prefix}options WHERE option_name = 'siteurl'"
+            f"SELECT option_name, option_value FROM {prefix}options WHERE option_name IN ('siteurl', 'home')"
         )
-        row = cur.fetchone()
-        if not row or not row["option_value"]:
-            console.print("[red]Error:[/red] siteurl not found in wp_options.")
-            sys.exit(1)
-        return row["option_value"].rstrip("/")
+        rows = {r["option_name"]: r["option_value"] for r in cur.fetchall()}
+
+    site_url = rows.get("siteurl") or rows.get("home")
+    if not site_url:
+        console.print("[red]Error:[/red] siteurl not found in wp_options.")
+        sys.exit(1)
+    site_url = site_url.rstrip("/")
+
+    hosts = set()
+    for val in rows.values():
+        host = urlparse(val).netloc.lower().split(":")[0]
+        if host:
+            hosts.add(host)
+    for key in ("WP_HOME", "WP_SITEURL"):
+        if key in cfg:
+            host = urlparse(cfg[key]).netloc.lower().split(":")[0]
+            if host:
+                hosts.add(host)
+
+    return site_url, hosts
 
 
 def fetch_posts(conn, prefix):
@@ -311,15 +338,15 @@ def extract_bare_urls(content):
     return embed_urls, reference_urls
 
 
-def is_external(url, site_host):
+def is_external(url, site_hosts):
     try:
         host = urlparse(url).netloc.lower().split(":")[0]
-        return bool(host) and host != site_host
+        return bool(host) and host not in site_hosts
     except Exception:
         return False
 
 
-def collect_urls(posts, site_url, site_host):
+def collect_urls(posts, site_url, site_hosts):
     """Return sorted list of (url, [(post_id, title, post_url, is_embed, is_bare_ref), ...])."""
     url_refs: dict[str, list] = defaultdict(list)
     for post in posts:
@@ -327,7 +354,7 @@ def collect_urls(posts, site_url, site_host):
         ref_base = (post["ID"], post["post_title"] or f"(ID {post['ID']})", post_url)
 
         def _add(url, is_embed, is_bare_ref=False):
-            if is_external(url, site_host):
+            if is_external(url, site_hosts):
                 ref = ref_base + (is_embed, is_bare_ref)
                 if ref not in url_refs[url]:
                     url_refs[url].append(ref)
@@ -802,14 +829,15 @@ def main():
 
     # Connect and gather data
     conn = get_connection(cfg)
-    site_url = get_site_url(conn, table_prefix)
-    site_host = urlparse(site_url).netloc.lower().split(":")[0]
+    site_url, site_hosts = get_site_info(conn, table_prefix, cfg)
     console.print(f"[dim]Site: {site_url}[/dim]")
+    if len(site_hosts) > 1:
+        console.print(f"[dim]Internal hosts: {', '.join(sorted(site_hosts))}[/dim]")
 
     posts = fetch_posts(conn, table_prefix)
     console.print(f"[dim]{len(posts)} published posts/pages[/dim]")
 
-    url_list = collect_urls(posts, site_url, site_host)
+    url_list = collect_urls(posts, site_url, site_hosts)
     conn.close()
     console.print(f"[dim]{len(url_list)} unique external URLs[/dim]\n")
 

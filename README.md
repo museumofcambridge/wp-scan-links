@@ -90,4 +90,4 @@ python scan-links.py --wp-config /path/to/wp-config.php
 
 ## License
 
-MIT
+See LICENSE

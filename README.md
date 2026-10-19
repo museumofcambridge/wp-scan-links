@@ -54,6 +54,7 @@ uv run /var/www/html/scan-links.py --test --output report.html
 | `--output FILE.html` | console | Write results to an HTML file |
 | `--test` | off | Test each URL and report HTTP status |
 | `--timeout SECS` | `10` | HTTP request timeout in seconds |
+| `--report-url URL` | `file://` path of `--output` | Where the HTML report is served; shown as the link in the summary |
 
 ## Output
 
@@ -65,6 +66,28 @@ uv run /var/www/html/scan-links.py --test --output report.html
 
 ERROR  DNS failure: host not found
      ↳ Another Post   https://mysite.com/?p=99
+```
+
+### Running from cron
+
+When the output isn't a terminal (e.g. under cron), per-URL progress is suppressed, so the emailed output is just the summary and a link to the report:
+
+```sh
+uv run scan-links.py --test --output /var/www/html/links.html --report-url https://example.com/links.html
+```
+
+```
+Site: https://example.com
+412 published posts/pages
+1873 unique external URLs
+
+Generated 2026-10-19 03:00:12
+  1873 URLs
+  site: https://example.com
+  1702 tested
+  41 failed/error
+  171 skipped (browser-only)
+Report: https://example.com/links.html
 ```
 
 ### HTML

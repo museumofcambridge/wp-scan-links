@@ -17,6 +17,8 @@ Usage:
     --output FILE.html    Write results to HTML file (default: console)
     --test                Test each URL for accessibility and embed permissions
     --timeout N           HTTP timeout in seconds (default: 10)
+    --report-url URL      URL where the HTML report will be served, shown in the
+                          summary (default: file:// path of --output)
 
 Detects:
   - Regular external URLs (href, src, action attributes, CSS url())
@@ -29,6 +31,9 @@ When testing embeds, checks that:
   - Embedding is allowed (X-Frame-Options and CSP headers)
 
 Interrupt testing with Ctrl+C — partial results will still be output.
+
+When not attached to a terminal (e.g. run from cron), per-URL progress is
+suppressed so the output is just the summary and a link to the HTML report.
 """
 
 import argparse
@@ -684,21 +689,33 @@ a.edit:hover { color: #1155cc; }
 .ref-badge { background: #eee; color: #666; padding: 2px 6px; border-radius: 3px; font-size: 0.75em; font-style: italic; }
 """
 
-def write_html(url_list, output_file, test_results=None, site_url=None):
+def summary_parts(url_list, test_results=None, site_url=None) -> list[str]:
+    """Summary line items shown at the top of the HTML report (unescaped)."""
+    parts = [f"{len(url_list)} URLs"]
+    if site_url:
+        parts.append(f"site: {site_url}")
+    if test_results is not None:
+        tested_count = len(test_results)
+        fail_count = sum(
+            1 for code, err, note in test_results.values()
+            if err or (code is not None and code >= 400)
+        )
+        skip_count = sum(
+            1 for code, err, note in test_results.values()
+            if code is None and not err
+        )
+        parts += [f"{tested_count - skip_count} tested", f"{fail_count} failed/error"]
+        if skip_count:
+            parts.append(f"{skip_count} skipped (browser-only)")
+    return parts
+
+
+def write_html(url_list, output_file, test_results=None, site_url=None, timestamp=None):
     has_test = test_results is not None
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = timestamp or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     title = "WordPress External Links"
     if has_test:
         title += " — Test Results"
-    tested_count = len(test_results) if test_results else 0
-    fail_count = sum(
-        1 for code, err, note in (test_results or {}).values()
-        if err or (code is not None and code >= 400)
-    )
-    skip_count = sum(
-        1 for code, err, note in (test_results or {}).values()
-        if code is None and not err
-    )
 
     if has_test:
         col_defs = '<col class="url"><col class="status"><col class="refs">'
@@ -750,15 +767,7 @@ def write_html(url_list, output_file, test_results=None, site_url=None):
                 f"</tr>"
             )
 
-    meta_parts = [
-        f"{len(url_list)} URLs",
-        f"site: {esc(site_url)}" if site_url else "",
-    ]
-    if has_test:
-        meta_parts += [f"{tested_count - skip_count} tested", f"{fail_count} failed/error"]
-        if skip_count:
-            meta_parts.append(f"{skip_count} skipped (browser-only)")
-    meta = " &nbsp;·&nbsp; ".join(p for p in meta_parts if p)
+    meta = " &nbsp;·&nbsp; ".join(esc(p) for p in summary_parts(url_list, test_results, site_url))
 
     page = f"""<!DOCTYPE html>
 <html lang="en">
@@ -782,7 +791,6 @@ def write_html(url_list, output_file, test_results=None, site_url=None):
 </html>
 """
     Path(output_file).write_text(page, encoding="utf-8")
-    console.print(f"[green]Written:[/green] {output_file}")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -813,7 +821,16 @@ def main():
         "--timeout", type=float, default=10, metavar="SECS",
         help="HTTP request timeout in seconds (default: 10)",
     )
+    parser.add_argument(
+        "--report-url", metavar="URL",
+        help="URL where the HTML report is served, shown in the summary "
+             "(default: file:// path of --output)",
+    )
     args = parser.parse_args()
+
+    # Per-URL progress is only useful interactively; under cron it would
+    # bury the summary in the emailed output.
+    progress = console.is_terminal
 
     # Load config
     config_path = Path(args.wp_config)
@@ -846,12 +863,15 @@ def main():
     if args.test:
         test_results = {}
         total = len(url_list)
-        console.print(f"Testing {total} URLs (Ctrl+C to stop and save partial results)\n")
+        if progress:
+            console.print(f"Testing {total} URLs (Ctrl+C to stop and save partial results)\n")
 
         def _domain(url: str) -> str:
             return urlparse(url).netloc.lower()
 
         def _print_status(code, error, note=None) -> None:
+            if not progress:
+                return
             if error:
                 console.print(f"[red]ERROR[/red] [dim]{error}[/dim]")
             elif code is None:
@@ -877,10 +897,11 @@ def main():
         while queue and not _interrupted:
             orig_idx, url, refs = queue.popleft()
             seq += 1
-            console.print(f"[dim][{seq}/{total}][/dim] {url} ", end="")
+            if progress:
+                console.print(f"[dim][{seq}/{total}][/dim] {url} ", end="")
 
             if _is_browser_only(url):
-                console.print("[dim]SKIP (browser-only)[/dim]")
+                _print_status(None, None, "browser-only")
                 test_results[url] = (None, None, "browser-only")
                 continue
 
@@ -899,7 +920,8 @@ def main():
                 for item in queue:
                     (retries if _domain(item[1]) == domain else remaining).append(item)
                 queue = remaining
-                console.print("[yellow]429 — rate limited, deferred[/yellow]")
+                if progress:
+                    console.print("[yellow]429 — rate limited, deferred[/yellow]")
             else:
                 test_results[url] = (code, error, note)
                 _print_status(code, error, note)
@@ -907,14 +929,16 @@ def main():
         # Phase 2: retry deferred URLs
         if retries and not _interrupted:
             n_domains = len(deferred_domains)
-            console.print(
-                f"\n[bold]Retrying {len(retries)} deferred URL(s) "
-                f"from {n_domains} rate-limited domain(s)[/bold]\n"
-            )
+            if progress:
+                console.print(
+                    f"\n[bold]Retrying {len(retries)} deferred URL(s) "
+                    f"from {n_domains} rate-limited domain(s)[/bold]\n"
+                )
             for orig_idx, url, refs in retries:
                 if _interrupted:
                     break
-                console.print(f"[dim][retry][/dim] {url} ", end="")
+                if progress:
+                    console.print(f"[dim][retry][/dim] {url} ", end="")
                 if _has_embed_ref(refs):
                     code, error, note = test_embed_url(url, args.timeout)
                 else:
@@ -922,11 +946,19 @@ def main():
                 test_results[url] = (code, error, note)
                 _print_status(code, error, note)
 
-        console.print()
+        if progress:
+            console.print()
 
     # Output results
     if args.output:
-        write_html(url_list, args.output, test_results, site_url)
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        write_html(url_list, args.output, test_results, site_url, timestamp)
+        report_link = args.report_url or Path(args.output).resolve().as_uri()
+        console.print(f"Generated {timestamp}")
+        for part in summary_parts(url_list, test_results, site_url):
+            console.print(f"  {part}", highlight=False, soft_wrap=True)
+        # soft_wrap stops Rich folding long URLs at 80 columns off-terminal
+        console.print(f"[green]Report:[/green] {report_link}", soft_wrap=True)
     else:
         print_console_list(url_list, test_results)
 

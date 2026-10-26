@@ -68,9 +68,7 @@ console = Console(stderr=True)
 
 def parse_wp_config(config_path: Path) -> dict:
     """
-    Parse DB constants and table prefix from a wp-config.php file.
-    Follows local include: if local/wp-config.php exists alongside the main
-    file, parse it first so its defines take precedence (matching PHP behaviour).
+    Parse DB constants and table prefix from wp-config.php and wp-config.env.php files.
     """
     define_re = re.compile(
         r"""define\s*\(\s*['"](\w+)['"]\s*,\s*['"]([^'"]*)['"]\s*\)""",
@@ -91,10 +89,10 @@ def parse_wp_config(config_path: Path) -> dict:
             if m:
                 values["table_prefix"] = m.group(1)
 
-    # Check for local override (mirrors the PHP include logic)
-    local_config = config_path.parent / "local" / "wp-config.php"
-    if local_config.exists():
-        _parse_file(local_config)
+    # Check for seprate config env file
+    config_env = config_path.parent / "wp-config.env.php"
+    if config_env.exists():
+        _parse_file(config_env)
 
     _parse_file(config_path)
     return values

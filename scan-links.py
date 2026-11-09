@@ -19,6 +19,11 @@ Usage:
     --timeout N           HTTP timeout in seconds (default: 10)
     --report-url URL      URL where the HTML report will be served, shown in the
                           summary (default: file:// path of --output)
+    --db FILE             SQLite database recording every check result
+                          (default: ~/.local/share/scan-links/history.sqlite)
+    --no-db               Don't record results or show failure history
+    --persistent N        Consecutive failures before a failure is flagged as
+                          persistent (default: 3)
 
 Detects:
   - Regular external URLs (href, src, action attributes, CSS url())
@@ -30,6 +35,11 @@ When testing embeds, checks that:
   - The resource exists (HTTP 200)
   - Embedding is allowed (X-Frame-Options and CSP headers)
 
+With --test, results are sorted: failures first (grouped by status), then
+redirects, skipped and finally successful URLs. Each check is recorded in a
+local SQLite database, and the HTML report shows each failure's history
+(consecutive failures, when it last worked, intermittent vs persistent).
+
 Interrupt testing with Ctrl+C — partial results will still be output.
 
 When not attached to a terminal (e.g. run from cron), per-URL progress is
@@ -40,7 +50,9 @@ import argparse
 import html as html_lib
 from http import HTTPStatus
 import re
+import os
 import signal
+import sqlite3
 import sys
 from collections import defaultdict, deque
 from datetime import datetime
@@ -620,10 +632,159 @@ def esc(s):
     return html_lib.escape(str(s))
 
 
+# ── Check history (SQLite) ─────────────────────────────────────────────────────
+
+_DB_SCHEMA = """
+CREATE TABLE IF NOT EXISTS runs (
+    id          INTEGER PRIMARY KEY,
+    site_url    TEXT NOT NULL,
+    started_at  TEXT NOT NULL,
+    finished_at TEXT,
+    interrupted INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS checks (
+    id          INTEGER PRIMARY KEY,
+    run_id      INTEGER NOT NULL REFERENCES runs(id),
+    url         TEXT NOT NULL,
+    checked_at  TEXT NOT NULL,
+    outcome     TEXT NOT NULL,      -- ok | redirect | fail | skip
+    status_code INTEGER,
+    error       TEXT,
+    note        TEXT
+);
+CREATE INDEX IF NOT EXISTS checks_url ON checks(url, checked_at);
+"""
+
+
+def _default_db_path() -> Path:
+    base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
+    return Path(base) / "scan-links" / "history.sqlite"
+
+
+def _now_iso() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def open_db(path: Path) -> sqlite3.Connection:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(path)
+    db.executescript(_DB_SCHEMA)
+    return db
+
+
+def start_run(db, site_url: str) -> int:
+    cur = db.execute(
+        "INSERT INTO runs (site_url, started_at) VALUES (?, ?)", (site_url, _now_iso())
+    )
+    db.commit()
+    return cur.lastrowid
+
+
+def record_check(db, run_id: int, url: str, result: tuple) -> None:
+    code, error, note = result
+    db.execute(
+        "INSERT INTO checks (run_id, url, checked_at, outcome, status_code, error, note)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (run_id, url, _now_iso(), _status_class(code, error), code, error, note),
+    )
+
+
+def finish_run(db, run_id: int, interrupted: bool) -> None:
+    db.execute(
+        "UPDATE runs SET finished_at = ?, interrupted = ? WHERE id = ?",
+        (_now_iso(), int(interrupted), run_id),
+    )
+    db.commit()
+
+
+def failure_history(db, site_url: str, urls, window: int = 10) -> dict[str, dict]:
+    """Summarise past checks of each URL (skipped checks are ignored).
+
+    Returns {url: {streak, since, last_ok, first_checked, checks,
+                   recent_fails, recent_total}} where `streak` is the number
+    of consecutive failures up to and including the latest check.
+    """
+    hist = {}
+    for url in urls:
+        rows = db.execute(
+            """SELECT c.checked_at, c.outcome FROM checks c JOIN runs r ON r.id = c.run_id
+               WHERE r.site_url = ? AND c.url = ? AND c.outcome != 'skip'
+               ORDER BY c.checked_at DESC, c.id DESC""",
+            (site_url, url),
+        ).fetchall()
+        if not rows:
+            continue
+        streak = 0
+        for _, outcome in rows:
+            if outcome != "fail":
+                break
+            streak += 1
+        recent = rows[:window]
+        hist[url] = {
+            "streak": streak,
+            "since": rows[streak - 1][0] if streak else None,
+            "last_ok": next((t for t, o in rows if o != "fail"), None),
+            "first_checked": rows[-1][0],
+            "checks": len(rows),
+            "recent_fails": sum(1 for _, o in recent if o == "fail"),
+            "recent_total": len(recent),
+        }
+    return hist
+
+
+def _is_persistent(h: dict | None, threshold: int) -> bool:
+    return bool(h) and h["streak"] >= threshold
+
+
+# ── Result ordering ───────────────────────────────────────────────────────────
+
+# Failures first, then redirects, skipped, untested (interrupted), successes.
+_CLASS_RANK = {"fail": 0, "redirect": 1, "skip": 2, "untested": 3, "ok": 4}
+
+
+def order_for_report(url_list, test_results=None, history=None):
+    """Group URLs by status for output.
+
+    Returns [(group_label_or_None, [(url, refs), ...]), ...]. Without test
+    results there's a single unlabelled group in URL order. Groups are
+    ordered by _CLASS_RANK, then ERROR before numeric codes, codes ascending.
+    Within a group, the longest-failing URLs come first, then by error/note
+    text so similar problems sit together.
+    """
+    if test_results is None:
+        return [(None, list(url_list))]
+    history = history or {}
+    groups: dict[tuple, list] = {}
+    for url, refs in url_list:
+        if url in test_results:
+            code, error, note = test_results[url]
+            cls = _status_class(code, error)
+            label = _status_label(code, error)
+            code_key = (0 if error else 1, code or 0)
+            detail = error or note or ""
+        else:
+            cls, label, code_key, detail = "untested", "NOT TESTED", (0, 0), ""
+        streak = history.get(url, {}).get("streak", 0)
+        groups.setdefault((_CLASS_RANK[cls], code_key, label), []).append(
+            ((-streak, detail, url), (url, refs))
+        )
+    return [
+        (label, [item for _, item in sorted(items, key=lambda x: x[0])])
+        for (_, _, label), items in sorted(groups.items(), key=lambda g: g[0])
+    ]
+
+
 # ── Console output ────────────────────────────────────────────────────────────
 
-def print_console_list(url_list, test_results=None):
-    for url, refs in url_list:
+def print_console_list(url_list, test_results=None, history=None):
+    for group_label, items in order_for_report(url_list, test_results, history):
+        if group_label is not None:
+            console.print(f"[bold reverse] {group_label} ({len(items)}) [/bold reverse]\n")
+        _print_console_items(items, test_results)
+
+
+def _print_console_items(items, test_results):
+    for url, refs in items:
         if test_results is not None:
             if url in test_results:
                 code, error, note = test_results[url]
@@ -659,9 +820,9 @@ body { font-family: system-ui, -apple-system, sans-serif; font-size: 14px;
 h1 { font-size: 1.25rem; margin-bottom: 0.2rem; }
 .meta { color: #666; font-size: 0.85rem; margin-bottom: 1.5rem; }
 table { border-collapse: collapse; width: 100%; table-layout: fixed; }
-col.url { width: 45%; }
-col.status { width: 7%; }
-col.refs { width: 48%; }
+col.url { width: 40%; }
+col.status { width: 18%; }
+col.refs { width: 42%; }
 col.refs-only { width: 55%; }
 th { text-align: left; padding: 0.5rem 0.75rem; background: #f0f0f0;
      border-bottom: 2px solid #ccc; position: sticky; top: 0; }
@@ -685,9 +846,20 @@ a.edit:hover { color: #1155cc; }
 .ref-item { display: flex; align-items: baseline; gap: 4px; }
 .embed-badge { background: #fff3cd; color: #856404; padding: 2px 6px; border-radius: 3px; font-size: 0.75em; font-weight: bold; }
 .ref-badge { background: #eee; color: #666; padding: 2px 6px; border-radius: 3px; font-size: 0.75em; font-style: italic; }
+tr.group td { background: #e4e4e4; font-weight: bold; border-bottom: 1px solid #ccc; padding-top: 0.6rem; }
+tr.group .count { color: #666; font-weight: normal; }
+.hist { margin-top: 0.3rem; color: #555; font-size: 0.8em; word-break: normal; }
+.hist div { margin-top: 1px; }
+.hist-badge { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 0.75em;
+              font-weight: bold; margin-top: 0.3rem; }
+.hist-badge.persistent { background: #c00; color: #fff; }
+.hist-badge.intermittent { background: #fde2c4; color: #8a4500; }
+.hist-badge.new { background: #dbe8ff; color: #1a4fa0; }
+.filter { margin: 0 0 1rem; font-size: 0.9rem; }
 """
 
-def summary_parts(url_list, test_results=None, site_url=None) -> list[str]:
+def summary_parts(url_list, test_results=None, site_url=None,
+                  history=None, threshold=3) -> list[str]:
     """Summary line items shown at the top of the HTML report (unescaped)."""
     parts = [f"{len(url_list)} URLs"]
     if site_url:
@@ -705,10 +877,78 @@ def summary_parts(url_list, test_results=None, site_url=None) -> list[str]:
         parts += [f"{tested_count - skip_count} tested", f"{fail_count} failed/error"]
         if skip_count:
             parts.append(f"{skip_count} skipped (browser-only)")
+        if history is not None and fail_count:
+            persistent = sum(
+                1 for url, (code, err, _) in test_results.items()
+                if _status_class(code, err) == "fail"
+                and _is_persistent(history.get(url), threshold)
+            )
+            parts.append(f"{persistent} persistent failures (≥{threshold} consecutive)")
     return parts
 
 
-def write_html(url_list, output_file, test_results=None, site_url=None, timestamp=None):
+def _date(iso: str) -> str:
+    return iso[:10]
+
+
+def _history_html(h: dict | None, threshold: int) -> str:
+    """Failure-history block shown under a failing URL's status."""
+    if not h:
+        return ""
+    streak = h["streak"]
+    lines = []
+    if h["checks"] == 1:
+        badge = ("new", "first check")
+        lines.append("First time checked")
+    elif streak >= threshold:
+        badge = ("persistent", "persistent")
+    elif h["recent_fails"] > streak:
+        badge = ("intermittent", "intermittent")
+    elif streak == 1:
+        badge = ("new", "new failure")
+    else:
+        badge = None
+
+    if streak > 1:
+        lines.append(f"Failed last {streak} checks, since {_date(h['since'])}")
+    elif streak == 1 and h["checks"] > 1:
+        lines.append("Failed this check only")
+    if h["last_ok"]:
+        lines.append(f"Last OK {_date(h['last_ok'])}")
+    elif h["checks"] > 1:
+        lines.append(f"Never OK (first checked {_date(h['first_checked'])})")
+    if h["recent_total"] > 1 and h["recent_fails"] != streak:
+        lines.append(f"{h['recent_fails']} of last {h['recent_total']} checks failed")
+
+    badge_html = (
+        f'<span class="hist-badge {badge[0]}">{esc(badge[1])}</span>' if badge else ""
+    )
+    return (
+        f'{badge_html}<div class="hist">'
+        + "".join(f"<div>{esc(line)}</div>" for line in lines)
+        + "</div>"
+    )
+
+
+_FILTER_JS = """
+const cb = document.getElementById('persistent-only');
+if (cb) cb.addEventListener('change', () => {
+  const t = +cb.dataset.threshold;
+  let groupRow = null, visible = 0;
+  const flush = () => { if (groupRow) groupRow.hidden = cb.checked && visible === 0; };
+  for (const tr of document.querySelectorAll('tbody tr')) {
+    if (tr.classList.contains('group')) { flush(); groupRow = tr; visible = 0; continue; }
+    const show = !cb.checked || +(tr.dataset.streak || 0) >= t;
+    tr.hidden = !show;
+    if (show) visible++;
+  }
+  flush();
+});
+"""
+
+
+def write_html(url_list, output_file, test_results=None, site_url=None, timestamp=None,
+               history=None, threshold=3):
     has_test = test_results is not None
     timestamp = timestamp or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     title = "WordPress External Links"
@@ -722,50 +962,28 @@ def write_html(url_list, output_file, test_results=None, site_url=None, timestam
         col_defs = '<col class="url"><col class="refs-only">'
         header = "<tr><th>URL</th><th>Referenced By</th></tr>"
 
+    n_cols = 3 if has_test else 2
     rows = []
-    for url, refs in url_list:
-        def _make_ref_html(ref):
-            pid, t, pu = ref[0], ref[1], ref[2]
-            is_embed = ref[3] if len(ref) > 3 else False
-            is_bare_ref = ref[4] if len(ref) > 4 else False
-            embed_badge = '<span class="embed-badge">[EMBED]</span>' if is_embed else ''
-            ref_badge = '<span class="ref-badge" title="Bare link surrounded by other text — treated as a reference, not an embed">reference only</span>' if is_bare_ref else ''
-            return (
-                f'<span class="ref-item">'
-                f'<a class="post" href="{esc(pu)}" target="_blank">{esc(t)}</a>'
-                f'{embed_badge}{ref_badge}'
-                f'<a class="edit" href="{esc(site_url)}/wp-admin/post.php?post={pid}&action=edit" target="_blank">(edit)</a>'
-                f'</span>'
-            )
-        ref_html = '<div class="refs">' + "".join(_make_ref_html(ref) for ref in refs) + "</div>"
-
-        if has_test:
-            if url not in test_results:
-                status_html = '<span class="untested">—</span>'
-                row_class = ""
-            else:
-                code, error, note = test_results[url]
-                cls = _status_class(code, error)
-                label = _status_label(code, error)
-                extra = f"<small>{esc(error[:120])}</small>" if error else (f"<small>{esc(note)}</small>" if note else "")
-                status_html = f'<span class="{cls}">{label}</span>{extra}'
-                row_class = f' class="{cls}"'
+    for group_label, items in order_for_report(url_list, test_results, history):
+        if group_label is not None:
             rows.append(
-                f'<tr{row_class}>'
-                f'<td><a class="ext" href="{esc(url)}" target="_blank">{esc(url)}</a></td>'
-                f'<td>{status_html}</td>'
-                f'<td>{ref_html}</td>'
-                f"</tr>"
+                f'<tr class="group"><td colspan="{n_cols}">{esc(group_label)} '
+                f'<span class="count">· {len(items)}</span></td></tr>'
             )
-        else:
-            rows.append(
-                f"<tr>"
-                f'<td><a class="ext" href="{esc(url)}" target="_blank">{esc(url)}</a></td>'
-                f'<td>{ref_html}</td>'
-                f"</tr>"
-            )
+        for url, refs in items:
+            rows.append(_html_row(url, refs, test_results, site_url, history, threshold))
 
-    meta = " &nbsp;·&nbsp; ".join(esc(p) for p in summary_parts(url_list, test_results, site_url))
+    meta = " &nbsp;·&nbsp; ".join(
+        esc(p) for p in summary_parts(url_list, test_results, site_url, history, threshold)
+    )
+
+    filter_html = ""
+    if history and has_test:
+        filter_html = (
+            f'<p class="filter"><label><input type="checkbox" id="persistent-only" '
+            f'data-threshold="{threshold}"> Show only persistent failures '
+            f'(failed ≥{threshold} consecutive checks)</label></p>'
+        )
 
     page = f"""<!DOCTYPE html>
 <html lang="en">
@@ -778,6 +996,7 @@ def write_html(url_list, output_file, test_results=None, site_url=None, timestam
 <body>
 <h1>{esc(title)}</h1>
 <p class="meta">Generated {timestamp} &nbsp;·&nbsp; {meta}</p>
+{filter_html}
 <table>
 <colgroup>{col_defs}</colgroup>
 <thead>{header}</thead>
@@ -785,10 +1004,59 @@ def write_html(url_list, output_file, test_results=None, site_url=None, timestam
 {"".join(rows)}
 </tbody>
 </table>
+<script>{_FILTER_JS}</script>
 </body>
 </html>
 """
     Path(output_file).write_text(page, encoding="utf-8")
+
+
+def _html_row(url, refs, test_results, site_url, history, threshold) -> str:
+    has_test = test_results is not None
+    def _make_ref_html(ref):
+        pid, t, pu = ref[0], ref[1], ref[2]
+        is_embed = ref[3] if len(ref) > 3 else False
+        is_bare_ref = ref[4] if len(ref) > 4 else False
+        embed_badge = '<span class="embed-badge">[EMBED]</span>' if is_embed else ''
+        ref_badge = '<span class="ref-badge" title="Bare link surrounded by other text — treated as a reference, not an embed">reference only</span>' if is_bare_ref else ''
+        return (
+            f'<span class="ref-item">'
+            f'<a class="post" href="{esc(pu)}" target="_blank">{esc(t)}</a>'
+            f'{embed_badge}{ref_badge}'
+            f'<a class="edit" href="{esc(site_url)}/wp-admin/post.php?post={pid}&action=edit" target="_blank">(edit)</a>'
+            f'</span>'
+        )
+    ref_html = '<div class="refs">' + "".join(_make_ref_html(ref) for ref in refs) + "</div>"
+
+    if has_test:
+        if url not in test_results:
+            status_html = '<span class="untested">—</span>'
+            row_class = ""
+        else:
+            code, error, note = test_results[url]
+            cls = _status_class(code, error)
+            label = _status_label(code, error)
+            extra = f"<small>{esc(error[:120])}</small>" if error else (f"<small>{esc(note)}</small>" if note else "")
+            row_class = f' class="{cls}"'
+            if cls == "fail" and history is not None:
+                h = history.get(url)
+                extra += _history_html(h, threshold)
+                row_class += f' data-streak="{h["streak"] if h else 0}"'
+            status_html = f'<span class="{cls}">{label}</span>{extra}'
+        return (
+            f'<tr{row_class}>'
+            f'<td><a class="ext" href="{esc(url)}" target="_blank">{esc(url)}</a></td>'
+            f'<td>{status_html}</td>'
+            f'<td>{ref_html}</td>'
+            f"</tr>"
+        )
+    else:
+        return (
+            f"<tr>"
+            f'<td><a class="ext" href="{esc(url)}" target="_blank">{esc(url)}</a></td>'
+            f'<td>{ref_html}</td>'
+            f"</tr>"
+        )
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -824,6 +1092,20 @@ def main():
         help="URL where the HTML report is served, shown in the summary "
              "(default: file:// path of --output)",
     )
+    parser.add_argument(
+        "--db", metavar="FILE", default=str(_default_db_path()),
+        help="SQLite database recording each check result "
+             "(default: %(default)s)",
+    )
+    parser.add_argument(
+        "--no-db", action="store_true",
+        help="Don't record check results or show failure history",
+    )
+    parser.add_argument(
+        "--persistent", type=int, default=3, metavar="N",
+        help="Consecutive failed checks before a failure counts as persistent "
+             "(default: 3)",
+    )
     args = parser.parse_args()
 
     # Per-URL progress is only useful interactively; under cron it would
@@ -858,9 +1140,19 @@ def main():
 
     # Test URLs if requested
     test_results = None
+    history = None
+    db = run_id = None
     if args.test:
         test_results = {}
         total = len(url_list)
+        if not args.no_db:
+            db = open_db(Path(args.db))
+            run_id = start_run(db, site_url)
+
+        def _set_result(url, result) -> None:
+            test_results[url] = result
+            if db is not None:
+                record_check(db, run_id, url, result)
         if progress:
             console.print(f"Testing {total} URLs (Ctrl+C to stop and save partial results)\n")
 
@@ -900,7 +1192,7 @@ def main():
 
             if _is_browser_only(url):
                 _print_status(None, None, "browser-only")
-                test_results[url] = (None, None, "browser-only")
+                _set_result(url, (None, None, "browser-only"))
                 continue
 
             # Use embed tester if this URL is used for embedding
@@ -921,7 +1213,7 @@ def main():
                 if progress:
                     console.print("[yellow]429 — rate limited, deferred[/yellow]")
             else:
-                test_results[url] = (code, error, note)
+                _set_result(url, (code, error, note))
                 _print_status(code, error, note)
 
         # Phase 2: retry deferred URLs
@@ -941,24 +1233,32 @@ def main():
                     code, error, note = test_embed_url(url, args.timeout)
                 else:
                     code, error, note = test_url(url, args.timeout)
-                test_results[url] = (code, error, note)
+                _set_result(url, (code, error, note))
                 _print_status(code, error, note)
 
         if progress:
             console.print()
 
+        if db is not None:
+            finish_run(db, run_id, _interrupted)
+            failing = [u for u, (c, e, _) in test_results.items()
+                       if _status_class(c, e) == "fail"]
+            history = failure_history(db, site_url, failing)
+            db.close()
+
     # Output results
     if args.output:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        write_html(url_list, args.output, test_results, site_url, timestamp)
+        write_html(url_list, args.output, test_results, site_url, timestamp,
+                   history, args.persistent)
         report_link = args.report_url or Path(args.output).resolve().as_uri()
         console.print(f"Generated {timestamp}")
-        for part in summary_parts(url_list, test_results, site_url):
+        for part in summary_parts(url_list, test_results, site_url, history, args.persistent):
             console.print(f"  {part}", highlight=False, soft_wrap=True)
         # soft_wrap stops Rich folding long URLs at 80 columns off-terminal
         console.print(f"[green]Report:[/green] {report_link}", soft_wrap=True)
     else:
-        print_console_list(url_list, test_results)
+        print_console_list(url_list, test_results, history)
 
 
 if __name__ == "__main__":
